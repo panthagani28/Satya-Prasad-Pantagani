@@ -1,4 +1,5 @@
 import { decodeLimit, parseFailureFromCause } from "../domain/parseFailure.js";
+import { BinaryFormatFailure } from "../domain/binaryContainer.js";
 import {
   createSwiftContextReader,
   type SwiftContextReader,
@@ -6,7 +7,6 @@ import {
 import type { ObjcSwiftMetadata } from "../domain/native/objcSwiftMetadata.js";
 import type { PointerResolution } from "../domain/apple/appleMachoFixups.js";
 import type { Segment, Section } from "../domain/apple/appleMachoSelection.js";
-import { BinaryFormatFailure } from "../domain/binaryContainer.js";
 import {
   issue,
   type FacetDecodeFacts,
@@ -203,18 +203,17 @@ const decoded = { status: "decoded" as const, reason: null };
 const SWIFT_STATIC_WITNESS_FLAGS_MASK = 0x78;
 /** Create a Swift ABI signed-relative pointer decoder that records relative_pointers. */
 export const createSwiftRelativeReader = (input: {
-  bytes: Buffer;
-  readers: SwiftDispatchReaders;
+  readers: SwiftDispatchReaders & { i32(address: bigint): number };
   budget: DispatchRecordBudget;
   result: ObjcSwiftMetadata;
 }) => {
-  const { bytes, readers: read, budget, result } = input;
+  const { readers: read, budget, result } = input;
   return (field: bigint, kind: SwiftRelativeField): SwiftRelativeValue => {
     const contract = relativeFieldContracts[kind];
     const indirectable = contract.encoding === "indirectable";
     const taggedDirect = contract.encoding === "taggedDirect";
     const nullable = contract.nullability === "nullable";
-    const displacement = bytes.readInt32LE(read.offset(field, 4));
+    const displacement = read.i32(field);
     const encodingTag = taggedDirect ? displacement & 3 : undefined;
     if (encodingTag !== undefined && encodingTag !== 0) {
       const reason = `Unsupported Swift type metadata record tag ${encodingTag}`;

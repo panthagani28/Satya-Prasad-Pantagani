@@ -1,4 +1,5 @@
 import { expectedAppleMetadataReadFailure } from "./AppleMetadataReadFailure.js";
+import { BinaryFormatFailure } from "../domain/binaryContainer.js";
 import { malformedInput, unsupportedInput } from "../domain/parseFailure.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
@@ -9,7 +10,6 @@ import type { PointerResolution } from "../domain/apple/appleMachoFixups.js";
 import type { Segment, Section } from "../domain/apple/appleMachoSelection.js";
 import { boundClassName, decodeObjcCategories } from "./AppleObjcCategories.js";
 import { readObjcPropertiesOf } from "./AppleObjcProperties.js";
-import { BinaryFormatFailure } from "../domain/binaryContainer.js";
 import type { DecodeIssue } from "../domain/apple/appleDispatchDecodeFacts.js";
 import { createObjcProtocolReader } from "./AppleObjcProtocols.js";
 import type {
@@ -83,7 +83,6 @@ const resolveSuperclass = (
 
 /** Decode Objective-C protocol lists, classlists, methods, and ivars into `result`. */
 export const decodeObjcDispatchFacets = (input: {
-  bytes: Buffer;
   sections: readonly Section[];
   segments: readonly Segment[];
   readers: ObjcDispatchReaders;
@@ -99,7 +98,6 @@ export const decodeObjcDispatchFacets = (input: {
   objcClassListScanTruncated: boolean;
 } => {
   const {
-    bytes,
     sections,
     segments,
     readers: read,
@@ -135,7 +133,7 @@ export const decodeObjcDispatchFacets = (input: {
       }
       const entry = list + 8n + BigInt(index * stride);
       const rel = (field: bigint) => {
-        const displacement = bytes.readInt32LE(read.offset(field, 4));
+        const displacement = read.i32(field);
         const target = field + BigInt(displacement);
         let fileOffset: number | null = null;
         try {
