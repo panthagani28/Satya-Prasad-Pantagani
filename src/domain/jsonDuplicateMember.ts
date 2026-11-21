@@ -224,7 +224,8 @@ const observeJsonMembers = (
       cursor?.member(name, text, index + 1);
       continue;
     }
-    switch (text[index]) {
+    // charAt keeps the switch over string; index is within the text here.
+    switch (text.charAt(index)) {
       case "{":
         cursor?.enter(true);
         open.push(new Set());
