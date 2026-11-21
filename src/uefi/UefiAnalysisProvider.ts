@@ -3,12 +3,21 @@ import type { UefiDecodeFormat } from "./FfsSections.js";
 import { sha256Hex } from "../kernel/sha256Hex.js";
 import { hostRangeErrorKind } from "../domain/parseFailure.js";
 import { errorMessage } from "../kernel/errorMessage.js";
-import { randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { inflate } from "node:zlib";
 import { promisify } from "node:util";
-import { join } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
+import { execFileOutput } from "../process/ExecFileOutput.js";
+import { isAbortOf } from "../process/SignalAbort.js";
+import {
+  isWindowsBatchFile,
+  windowsBatchCommand,
+} from "../process/WindowsBatchCommand.js";
+import { HOST_PLATFORM } from "../platform/HostPlatform.js";
 import {
   ArtifactResourceScope,
   readStableArtifact,
@@ -23,19 +32,30 @@ import {
 } from "../ports/AnalysisProvider.js";
 import type { UefiAnalysisPort } from "../ports/uefi/UefiAnalysisPort.js";
 import {
+  AnalysisCancelledError,
   cancelledBy,
   carriedReason,
   AnalysisInputError,
   AnalysisTimeoutError,
 } from "../domain/analysisErrorCore.js";
-import { analysisErrorWithCleanupDependencies } from "../domain/analysisErrorCleanup.js";
+import { ellipsisExcerpt } from "../domain/excerpt.js";
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "../domain/unicodeCodePointOrder.js";
+import {
+  analysisErrorWithCleanupDependencies,
+  analysisErrorWithCleanupFailure,
+} from "../domain/analysisErrorCleanup.js";
+import { analysisErrorWithCancellation } from "../domain/analysisErrorCancellation.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
-import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { Result } from "../domain/result.js";
 import { UEFI_FIRMWARE_LIMITS } from "../domain/uefi/uefiLimits.js";
 import {
   uefiResultSchemas,
+  type UefiDecompileResult,
   type UefiExtractResult,
   type UefiInspectResult,
   type UefiNvramInspectResult,
@@ -62,6 +82,7 @@ import { classifyProviderFailure } from "../providers/classifyProviderFailure.js
 import {
   publishUefiFiles,
   type UefiPublicationEntry,
+  type UefiWriteReceipt,
 } from "./UefiPublication.js";
 
 import { lzmaReplySchema } from "./UefiLzmaProtocol.js";
@@ -82,6 +103,200 @@ type ExtractInput = Extract<
 >["input"];
 type ExtractedFile = UefiExtractResult["files"][number];
 type ExtractionRange = UefiPayload["range"];
+
+interface DiscoveredUefiModule {
+  readonly guid: string | null;
+  readonly rawName: string;
+  readonly cleanName: string;
+  readonly phase: "SEC" | "PEI" | "DXE" | "SMM" | "APP" | "MISC";
+  readonly typeName?: string;
+  readonly bytes?: Buffer;
+  readonly sourcePath?: string;
+  readonly byteLength: number;
+}
+
+interface UefiEntryPointScaffolding {
+  readonly typedefs: readonly string[];
+  readonly prototype: string;
+  readonly functionDefinition: string;
+}
+
+export const buildUefiEntryPointScaffolding = (
+  identifier: string,
+  rawName: string,
+  byteLength: number,
+  phase: "SEC" | "PEI" | "DXE" | "SMM" | "APP" | "MISC",
+  typeName?: string,
+): UefiEntryPointScaffolding => {
+  const normType = typeName?.toLowerCase();
+  if (normType === "pei-core") {
+    return {
+      typedefs: [
+        "typedef void* EFI_SEC_PEI_HAND_OFF;",
+        "typedef void* EFI_PEI_PPI_DESCRIPTOR;",
+      ],
+      prototype: `void EFIAPI ${identifier}EntryPoint(const EFI_SEC_PEI_HAND_OFF *SecCoreData, const EFI_PEI_PPI_DESCRIPTOR *PpiList, void *Context);`,
+      functionDefinition: [
+        `void EFIAPI ${identifier}EntryPoint(`,
+        "    const EFI_SEC_PEI_HAND_OFF *SecCoreData,",
+        "    const EFI_PEI_PPI_DESCRIPTOR *PpiList,",
+        "    void *Context",
+        ") {",
+        `    // Reconstructed PEI Core EntryPoint scaffolding for ${rawName}`,
+        `    // Size: ${byteLength} bytes`,
+        "    (void)SecCoreData;",
+        "    (void)PpiList;",
+        "    (void)Context;",
+        "}",
+      ].join("\n"),
+    };
+  }
+
+  if (normType === "peim" || (normType === undefined && phase === "PEI")) {
+    return {
+      typedefs: [
+        "typedef int64_t EFI_STATUS;",
+        "typedef void* EFI_PEI_FILE_HANDLE;",
+        "struct _EFI_PEI_SERVICES;",
+        "typedef struct _EFI_PEI_SERVICES EFI_PEI_SERVICES;",
+        "#define EFI_SUCCESS 0",
+      ],
+      prototype: `EFI_STATUS EFIAPI ${identifier}EntryPoint(EFI_PEI_FILE_HANDLE FileHandle, const EFI_PEI_SERVICES **PeiServices);`,
+      functionDefinition: [
+        `EFI_STATUS EFIAPI ${identifier}EntryPoint(`,
+        "    EFI_PEI_FILE_HANDLE FileHandle,",
+        "    const EFI_PEI_SERVICES **PeiServices",
+        ") {",
+        `    // Reconstructed PEIM EntryPoint scaffolding for ${rawName}`,
+        `    // Size: ${byteLength} bytes`,
+        "    EFI_STATUS Status = EFI_SUCCESS;",
+        "    (void)FileHandle;",
+        "    (void)PeiServices;",
+        "    return Status;",
+        "}",
+      ].join("\n"),
+    };
+  }
+
+  if (
+    normType === "security-core" ||
+    (normType === undefined && phase === "SEC")
+  ) {
+    return {
+      typedefs: [],
+      prototype: `void EFIAPI ${identifier}EntryPoint(void *PeiCoreEntryPoint);`,
+      functionDefinition: [
+        `void EFIAPI ${identifier}EntryPoint(`,
+        "    void *PeiCoreEntryPoint",
+        ") {",
+        `    // Reconstructed SEC EntryPoint scaffolding for ${rawName}`,
+        `    // Size: ${byteLength} bytes`,
+        "    (void)PeiCoreEntryPoint;",
+        "}",
+      ].join("\n"),
+    };
+  }
+
+  if (normType === "dxe-core") {
+    return {
+      typedefs: [],
+      prototype: `void EFIAPI ${identifier}EntryPoint(void *HobStart);`,
+      functionDefinition: [
+        `void EFIAPI ${identifier}EntryPoint(`,
+        "    void *HobStart",
+        ") {",
+        `    // Reconstructed DXE Core EntryPoint scaffolding for ${rawName}`,
+        `    // Size: ${byteLength} bytes`,
+        "    (void)HobStart;",
+        "}",
+      ].join("\n"),
+    };
+  }
+
+  return {
+    typedefs: [
+      "typedef int64_t EFI_STATUS;",
+      "typedef void* EFI_HANDLE;",
+      "struct _EFI_SYSTEM_TABLE;",
+      "typedef struct _EFI_SYSTEM_TABLE EFI_SYSTEM_TABLE;",
+      "#define EFI_SUCCESS 0",
+    ],
+    prototype: `EFI_STATUS EFIAPI ${identifier}EntryPoint(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable);`,
+    functionDefinition: [
+      `EFI_STATUS EFIAPI ${identifier}EntryPoint(`,
+      "    EFI_HANDLE ImageHandle,",
+      "    EFI_SYSTEM_TABLE *SystemTable",
+      ") {",
+      `    // Reconstructed EntryPoint scaffolding for ${rawName}`,
+      `    // Size: ${byteLength} bytes`,
+      "    EFI_STATUS Status = EFI_SUCCESS;",
+      "    (void)ImageHandle;",
+      "    (void)SystemTable;",
+      "    return Status;",
+      "}",
+    ].join("\n"),
+  };
+};
+
+const isBufferLimitExceeded = (err: unknown): boolean => {
+  if (hostRangeErrorKind(err) === "host-capacity") {
+    return true;
+  }
+  if (err instanceof Error && err.message.includes("maxBuffer")) {
+    return true;
+  }
+  const code = (err as { code?: unknown })?.code;
+  return code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+};
+
+const resolveGhidraHeadless = (): string | null => {
+  const isWindows = HOST_PLATFORM.platform === "win32";
+  const headlessName = isWindows ? "analyzeHeadless.bat" : "analyzeHeadless";
+
+  // An explicit setting remains authoritative even when malformed or stale;
+  // automatic discovery is only a fallback when the caller supplied none.
+  const envDir = process.env.GHIDRA_INSTALL_DIR;
+  if (typeof envDir === "string" && envDir.trim().length > 0) {
+    const candidate = join(envDir, "support", headlessName);
+    const properties = join(envDir, "Ghidra", "application.properties");
+    if (existsSync(candidate) && existsSync(properties)) {
+      return candidate;
+    }
+    // Explicit setting was provided but is invalid or stale: do not fall back.
+    return null;
+  }
+
+  // Fallback discovery only when no explicit setting was provided
+  const pathEnv = process.env.PATH ?? "";
+  const pathDirs = pathEnv
+    .split(isWindows ? ";" : ":")
+    .filter((p) => p.length > 0);
+  for (const dir of pathDirs) {
+    const directHeadless = join(dir, headlessName);
+    if (existsSync(directHeadless)) return directHeadless;
+
+    const subHeadless = join(dir, "support", headlessName);
+    if (existsSync(subHeadless)) return subHeadless;
+
+    const ghidraRunName = isWindows ? "ghidraRun.bat" : "ghidraRun";
+    const ghidraRun = join(dir, ghidraRunName);
+    if (existsSync(ghidraRun)) {
+      const fromGhidraRun = join(dir, "support", headlessName);
+      if (existsSync(fromGhidraRun)) return fromGhidraRun;
+    }
+  }
+
+  const systemCandidates = ["/opt/ghidra", "/usr/share/ghidra"];
+  for (const root of systemCandidates) {
+    const candidate = join(root, "support", headlessName);
+    const properties = join(root, "Ghidra", "application.properties");
+    if (existsSync(candidate) && existsSync(properties)) {
+      return candidate;
+    }
+  }
+
+  return null;
+};
 
 /** Offsets are scoped to the scanner's exact stream and may repeat across streams. */
 const selectTarget = (
@@ -204,7 +419,12 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
   ): Result<AnalysisExecution, AnalysisError> {
     return {
       ok: false,
-      error: cancelledBy(request.operation, carriedReason(reason)),
+      error:
+        reason instanceof AnalysisTimeoutError
+          ? new AnalysisTimeoutError(request.operation, reason.timeoutMs, {
+              cause: reason,
+            })
+          : cancelledBy(request.operation, carriedReason(reason)),
     };
   }
 
@@ -267,16 +487,22 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
     const expire = () => controller.abort(deadlineReason);
     const timer = setTimeout(expire, timeoutMs);
     const parent = options?.signal;
-    const onParentAbort = () =>
-      controller.abort(
-        cancelledBy(request.operation, carriedReason(parent?.reason)),
-      );
+    const onParentAbort = () => {
+      const reason = parent?.reason;
+      if (reason instanceof AnalysisTimeoutError) {
+        controller.abort(reason);
+      } else {
+        controller.abort(cancelledBy(request.operation, carriedReason(reason)));
+      }
+    };
     if (parent?.aborted) onParentAbort();
     else parent?.addEventListener("abort", onParentAbort, { once: true });
     const checkpoint = (): void => {
       if (performance.now() >= deadline) expire();
       controller.signal.throwIfAborted();
     };
+    const remainingTimeMs = (): number =>
+      Math.max(0, deadline - performance.now());
     try {
       return {
         ok: true,
@@ -284,6 +510,7 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
           request,
           controller.signal,
           checkpoint,
+          remainingTimeMs,
         ),
       };
     } catch (cause: unknown) {
@@ -304,6 +531,7 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
     request: UefiRequest,
     signal: AbortSignal,
     checkpoint: () => void,
+    remainingTimeMs?: () => number,
   ): Promise<AnalysisExecution> {
     const finishObservation = (value: AnalysisExecution): AnalysisExecution => {
       try {
@@ -322,6 +550,21 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
     };
     return this.#resources.run(async () => {
       checkpoint();
+      let isDirectory = false;
+      try {
+        const pathStat = await stat(request.input.path);
+        isDirectory = pathStat.isDirectory();
+      } catch {
+        // Continue to regular file artifact read
+      }
+      if (isDirectory && request.operation === "decompile_uefi_firmware") {
+        return await this.#decompileDirectory(
+          request,
+          signal,
+          checkpoint,
+          remainingTimeMs,
+        );
+      }
       const snapshot = await readStableArtifact(
         request.input.path,
         UEFI_FIRMWARE_LIMITS.inputBytes,
@@ -341,11 +584,17 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
       }
       const scan = await scanUefiImage(
         snapshot.bytes,
-        {
-          maxDepth: request.input.max_depth,
-          maxVolumes: request.input.max_volumes,
-          maxFiles: request.input.max_files,
-        },
+        request.operation === "decompile_uefi_firmware"
+          ? {
+              maxDepth: UEFI_FIRMWARE_LIMITS.defaultMaxDepth,
+              maxVolumes: UEFI_FIRMWARE_LIMITS.defaultMaxVolumes,
+              maxFiles: UEFI_FIRMWARE_LIMITS.defaultMaxFiles,
+            }
+          : {
+              maxDepth: request.input.max_depth,
+              maxVolumes: request.input.max_volumes,
+              maxFiles: request.input.max_files,
+            },
         ({ payload, format, maxOutputBytes }) =>
           this.#decodeStream(
             request.operation,
@@ -364,6 +613,16 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
           scan,
           signal,
           checkpoint,
+        );
+      }
+      if (request.operation === "decompile_uefi_firmware") {
+        return this.#decompileFirmware(
+          request,
+          snapshot.sha256,
+          scan,
+          signal,
+          checkpoint,
+          remainingTimeMs,
         );
       }
       return finishObservation(this.#inspect(request, snapshot.sha256, scan));
@@ -712,6 +971,1070 @@ export class UefiAnalysisProvider implements UefiAnalysisPort {
               .slice(0, 512)
               .map(({ detail }) => detail),
     });
+  }
+
+  async #stageAndPublishModules(
+    request: Extract<UefiRequest, { operation: "decompile_uefi_firmware" }>,
+    imageSha256: string,
+    discoveredModules: readonly DiscoveredUefiModule[],
+    limitations: readonly string[],
+    signal: AbortSignal,
+    checkpoint: () => void,
+    format: "file" | "directory" = "file",
+    remainingTimeMs?: () => number,
+  ): Promise<AnalysisExecution> {
+    const input = request.input;
+    const modulesToProcess = discoveredModules.slice(0, input.max_modules);
+
+    const effectiveLimitations = [...limitations];
+    if (discoveredModules.length > input.max_modules) {
+      effectiveLimitations.push(
+        `Decompilation capped at ${input.max_modules} of ${discoveredModules.length} discovered modules.`,
+      );
+    }
+
+    const tempRoot = await PrivateRuntimeRoot.create({
+      prefix: "rea-uefi-decompile-",
+    });
+
+    const ghidraBin = resolveGhidraHeadless();
+
+    const MAX_DISASSEMBLY_MODULE_BYTES = 2 * 1024 * 1024;
+    const MAX_DISASSEMBLY_TOTAL_BYTES = 64 * 1024 * 1024;
+    const MAX_DISASSEMBLY_FAILURE_DIAGNOSTICS = 20;
+    let recordedDisassemblyFailures = 0;
+    let totalStagedAsmBytes = 0;
+    let disassemblyEngineUsed: "llvm-objdump" | "objdump" | "none" = "none";
+
+    const MAX_DECOMPILE_MODULE_BYTES = 4 * 1024 * 1024;
+    const MAX_DECOMPILE_TOTAL_BYTES = 64 * 1024 * 1024;
+    let totalStagedCBytes = 0;
+
+    const MAX_RAW_PAYLOAD_TOTAL_BYTES = 128 * 1024 * 1024;
+    let totalStagedRawBytes = 0;
+
+    let publishedResult: UefiDecompileResult | undefined;
+    let establishedError: unknown;
+
+    try {
+      const occurrences = new Map<string, number>();
+      const phaseCounts = {
+        sec: 0,
+        pei: 0,
+        dxe: 0,
+        smm: 0,
+        app: 0,
+        misc: 0,
+      };
+
+      const stagedModules: Array<{
+        occurrence: number;
+        guid: string | null;
+        name: string;
+        phase: string;
+        disassembly_status: "ok" | "failed" | "omitted";
+        relative_c_file: string;
+        relative_asm_file: string | null;
+        relative_header_file: string;
+        relative_payload_file: string | null;
+        c_sha256: string;
+        asm_sha256: string | null;
+        header_sha256: string;
+        payload_sha256: string | null;
+        c_generator: "ghidra" | "scaffold";
+        asm_generator: "llvm-objdump" | "objdump" | null;
+        code_bytes: number;
+      }> = [];
+      const publicationEntries: UefiPublicationEntry[] = [];
+
+      for (const mod of modulesToProcess) {
+        checkpoint();
+        signal.throwIfAborted();
+
+        // Reserve time to finalize completed modules and publish them before the deadline
+        if (remainingTimeMs !== undefined) {
+          const timeLeft = remainingTimeMs();
+          const reserveTime = ghidraBin !== null ? 8_000 : 3_000;
+          if (timeLeft <= reserveTime) {
+            if (stagedModules.length > 0) {
+              effectiveLimitations.push(
+                `Decompilation halted early to finalize and publish ${stagedModules.length} completed modules before operation deadline.`,
+              );
+              break;
+            }
+          }
+        }
+
+        const modBytes =
+          mod.bytes ??
+          (mod.sourcePath ? await readFile(mod.sourcePath) : Buffer.alloc(0));
+
+        const phaseKey = mod.phase.toLowerCase() as keyof typeof phaseCounts;
+        if (phaseCounts[phaseKey] !== undefined) {
+          phaseCounts[phaseKey]++;
+        }
+
+        let cIdentifier = mod.cleanName.replace(/[^a-zA-Z0-9_]/g, "_");
+        if (/^[0-9]/.test(cIdentifier)) {
+          cIdentifier = `_${cIdentifier}`;
+        }
+
+        const dedupeKey = `${mod.phase}/${mod.guid ?? "noguid"}_${mod.cleanName}`;
+        const occurrence = occurrences.get(dedupeKey) ?? 0;
+        occurrences.set(dedupeKey, occurrence + 1);
+
+        const subDir =
+          occurrence === 0
+            ? `${mod.guid ?? "noguid"}_${mod.cleanName}`
+            : `${mod.guid ?? "noguid"}_${mod.cleanName}_${occurrence}`;
+        const moduleRelDir = `${mod.phase}/${subDir}`;
+
+        const efiRelPath = `${moduleRelDir}/${mod.cleanName}.efi`;
+        let relativePayloadFile: string | null = null;
+        let payloadSha256: string | null = null;
+        if (
+          totalStagedRawBytes + modBytes.length <=
+          MAX_RAW_PAYLOAD_TOTAL_BYTES
+        ) {
+          publicationEntries.push({
+            relativePath: efiRelPath,
+            bytes: modBytes,
+          });
+          totalStagedRawBytes += modBytes.length;
+          relativePayloadFile = efiRelPath;
+          payloadSha256 = sha256Hex(modBytes);
+        } else if (
+          !effectiveLimitations.includes(
+            "Raw executable payload staging truncated after reaching 128 MiB aggregate staging budget.",
+          )
+        ) {
+          effectiveLimitations.push(
+            "Raw executable payload staging truncated after reaching 128 MiB aggregate staging budget.",
+          );
+        }
+
+        const scaffold = buildUefiEntryPointScaffolding(
+          cIdentifier,
+          mod.rawName,
+          modBytes.length,
+          mod.phase,
+          mod.typeName,
+        );
+
+        const headerName = `${mod.cleanName}.h`;
+        const headerRelPath = `${moduleRelDir}/${headerName}`;
+        const headerGuard = `_UEFI_${cIdentifier.toUpperCase()}_H_`;
+        const headerContent = [
+          "/**",
+          ` * UEFI Module Header: ${mod.rawName}`,
+          ` * Phase: ${mod.phase}${mod.typeName ? ` | Type: ${mod.typeName}` : ""}`,
+          ` * GUID: ${mod.guid ?? "N/A"}`,
+          ` * Size: ${modBytes.length} bytes`,
+          " */",
+          `#ifndef ${headerGuard}`,
+          `#define ${headerGuard}`,
+          "",
+          "#include <stdint.h>",
+          "",
+          "#ifndef EFIAPI",
+          "#if defined(_WIN32) || defined(__CYGWIN__)",
+          "#define EFIAPI __cdecl",
+          "#else",
+          "#define EFIAPI",
+          "#endif",
+          "#endif",
+          "",
+          ...scaffold.typedefs,
+          ...(mod.guid
+            ? [`#define ${cIdentifier.toUpperCase()}_GUID "${mod.guid}"`]
+            : []),
+          "",
+          scaffold.prototype,
+          "",
+          `#endif // ${headerGuard}`,
+          "",
+        ].join("\n");
+        const headerBytes = Buffer.from(headerContent, "utf8");
+        const headerSha256 = sha256Hex(headerBytes);
+        publicationEntries.push({
+          relativePath: headerRelPath,
+          bytes: headerBytes,
+        });
+
+        let asmRelPath: string | null = null;
+        let asmSha256: string | null = null;
+        let asmGenerator: "llvm-objdump" | "objdump" | null = null;
+        let disassemblyStatus: "ok" | "failed" | "omitted" = "omitted";
+        const tempEfiPath = join(
+          tempRoot.path,
+          `${cIdentifier}_${occurrence}.efi`,
+        );
+        let ghidraOutC: string | undefined;
+
+        await writeFile(tempEfiPath, modBytes);
+        try {
+          if (input.include_disassembly) {
+            const remainingAsmBytes =
+              MAX_DISASSEMBLY_TOTAL_BYTES - totalStagedAsmBytes;
+            if (remainingAsmBytes <= 0) {
+              disassemblyStatus = "omitted";
+              if (
+                !effectiveLimitations.includes(
+                  "Disassembly output truncated after reaching 64 MiB aggregate staging budget.",
+                )
+              ) {
+                effectiveLimitations.push(
+                  "Disassembly output truncated after reaching 64 MiB aggregate staging budget.",
+                );
+              }
+            } else {
+              const maxAsmBuffer = Math.min(
+                MAX_DISASSEMBLY_MODULE_BYTES,
+                remainingAsmBytes,
+              );
+              let asmOutput: string | null = null;
+              let llvmErrorMsg: string | null = null;
+              let objdumpErrorMsg: string | null = null;
+              let llvmError: unknown;
+              let objdumpError: unknown;
+              try {
+                const { stdout } = await execFileOutput(
+                  "llvm-objdump",
+                  ["-d", "--no-show-raw-insn", tempEfiPath],
+                  {
+                    signal,
+                    stopSignal: "SIGTERM",
+                    timeout: 15_000,
+                    maxBuffer: maxAsmBuffer,
+                  },
+                );
+                asmOutput = stdout;
+                asmGenerator = "llvm-objdump";
+                disassemblyEngineUsed = "llvm-objdump";
+              } catch (err: unknown) {
+                if (signal.aborted) signal.throwIfAborted();
+                if (isAbortOf(err, signal)) throw err;
+                llvmError = err;
+                llvmErrorMsg = errorMessage(err);
+                try {
+                  const { stdout } = await execFileOutput(
+                    "objdump",
+                    ["-d", tempEfiPath],
+                    {
+                      signal,
+                      stopSignal: "SIGTERM",
+                      timeout: 15_000,
+                      maxBuffer: maxAsmBuffer,
+                    },
+                  );
+                  asmOutput = stdout;
+                  asmGenerator = "objdump";
+                  if (disassemblyEngineUsed === "none") {
+                    disassemblyEngineUsed = "objdump";
+                  }
+                } catch (err2: unknown) {
+                  if (signal.aborted) signal.throwIfAborted();
+                  if (isAbortOf(err2, signal)) throw err2;
+                  objdumpError = err2;
+                  objdumpErrorMsg = errorMessage(err2);
+                  asmOutput = null;
+                }
+              }
+              if (asmOutput !== null) {
+                const asmBytes = Buffer.from(asmOutput, "utf8");
+                if (
+                  totalStagedAsmBytes + asmBytes.length <=
+                  MAX_DISASSEMBLY_TOTAL_BYTES
+                ) {
+                  const asmName = `${mod.cleanName}.asm`;
+                  asmRelPath = `${moduleRelDir}/${asmName}`;
+                  asmSha256 = sha256Hex(asmBytes);
+                  publicationEntries.push({
+                    relativePath: asmRelPath,
+                    bytes: asmBytes,
+                  });
+                  totalStagedAsmBytes += asmBytes.length;
+                  disassemblyStatus = "ok";
+                } else {
+                  disassemblyStatus = "omitted";
+                  if (
+                    !effectiveLimitations.includes(
+                      "Disassembly output truncated after reaching 64 MiB aggregate staging budget.",
+                    )
+                  ) {
+                    effectiveLimitations.push(
+                      "Disassembly output truncated after reaching 64 MiB aggregate staging budget.",
+                    );
+                  }
+                }
+              } else {
+                if (
+                  isBufferLimitExceeded(llvmError) ||
+                  isBufferLimitExceeded(objdumpError)
+                ) {
+                  disassemblyStatus = "omitted";
+                  if (
+                    !effectiveLimitations.includes(
+                      "Disassembly output truncated after reaching 64 MiB aggregate staging budget.",
+                    )
+                  ) {
+                    effectiveLimitations.push(
+                      "Disassembly output truncated after reaching 64 MiB aggregate staging budget.",
+                    );
+                  }
+                } else {
+                  disassemblyStatus = "failed";
+                  const sanitizeDiag = (msg: string | null): string => {
+                    if (msg === null) return "unknown";
+                    const line = msg.replace(/[\r\n\t]+/g, " ").trim();
+                    return ellipsisExcerpt(line, 120);
+                  };
+                  if (
+                    recordedDisassemblyFailures <
+                    MAX_DISASSEMBLY_FAILURE_DIAGNOSTICS
+                  ) {
+                    effectiveLimitations.push(
+                      `Disassembly for ${mod.rawName} failed: llvm-objdump (${sanitizeDiag(llvmErrorMsg)}), objdump (${sanitizeDiag(objdumpErrorMsg)})`,
+                    );
+                    recordedDisassemblyFailures++;
+                  } else if (
+                    !effectiveLimitations.includes(
+                      "Additional disassembly failure diagnostics omitted after reaching diagnostics budget.",
+                    )
+                  ) {
+                    effectiveLimitations.push(
+                      "Additional disassembly failure diagnostics omitted after reaching diagnostics budget.",
+                    );
+                  }
+                }
+              }
+            }
+          }
+
+          const cName = `${mod.cleanName}.c`;
+          const cRelPath = `${moduleRelDir}/${cName}`;
+          let cContent: string | null = null;
+          let cGenerator: "ghidra" | "scaffold" = "scaffold";
+
+          if (ghidraBin !== null) {
+            const remainingCBytes =
+              MAX_DECOMPILE_TOTAL_BYTES - totalStagedCBytes;
+            if (remainingCBytes <= 0) {
+              if (
+                !effectiveLimitations.includes(
+                  "Decompiled C output truncated after reaching 64 MiB aggregate staging budget.",
+                )
+              ) {
+                effectiveLimitations.push(
+                  "Decompiled C output truncated after reaching 64 MiB aggregate staging budget.",
+                );
+              }
+            } else {
+              ghidraOutC = join(
+                tempRoot.path,
+                `${cIdentifier}_${occurrence}_decompiled.c`,
+              );
+              try {
+                const bridgeDir = resolve(
+                  fileURLToPath(import.meta.url),
+                  "..",
+                  "..",
+                  "bridge",
+                  "ghidra",
+                );
+                const ghidraArgs = [
+                  tempRoot.path,
+                  `UefiDecomp_${cIdentifier}_${occurrence}`,
+                  "-import",
+                  tempEfiPath,
+                  "-scriptPath",
+                  bridgeDir,
+                  "-postScript",
+                  "ReaDecompileToC.java",
+                  ghidraOutC,
+                  "-deleteProject",
+                ];
+                let execCmd = ghidraBin;
+                let execArgs = ghidraArgs;
+                if (
+                  HOST_PLATFORM.platform === "win32" &&
+                  isWindowsBatchFile(ghidraBin)
+                ) {
+                  const batch = windowsBatchCommand({
+                    environment: process.env,
+                    batchPath: ghidraBin,
+                    arguments: ghidraArgs,
+                  });
+                  execCmd = batch.command;
+                  execArgs = [...batch.arguments];
+                }
+                await execFileOutput(execCmd, execArgs, {
+                  signal,
+                  stopSignal: "SIGTERM",
+                  timeout: 45_000,
+                  maxBuffer: 10 * 1024 * 1024,
+                });
+                if (existsSync(ghidraOutC)) {
+                  const cStat = await stat(ghidraOutC);
+                  const maxCBytes = Math.min(
+                    MAX_DECOMPILE_MODULE_BYTES,
+                    remainingCBytes,
+                  );
+                  if (cStat.size <= maxCBytes) {
+                    const candidateC = await readFile(ghidraOutC, "utf8");
+                    const candidateCBytes = Buffer.byteLength(
+                      candidateC,
+                      "utf8",
+                    );
+                    if (
+                      totalStagedCBytes + candidateCBytes <=
+                      MAX_DECOMPILE_TOTAL_BYTES
+                    ) {
+                      cContent = candidateC;
+                      totalStagedCBytes += candidateCBytes;
+                      cGenerator = "ghidra";
+                    } else if (
+                      !effectiveLimitations.includes(
+                        "Decompiled C output truncated after reaching 64 MiB aggregate staging budget.",
+                      )
+                    ) {
+                      effectiveLimitations.push(
+                        "Decompiled C output truncated after reaching 64 MiB aggregate staging budget.",
+                      );
+                    }
+                  } else if (
+                    cStat.size > remainingCBytes &&
+                    !effectiveLimitations.includes(
+                      "Decompiled C output truncated after reaching 64 MiB aggregate staging budget.",
+                    )
+                  ) {
+                    effectiveLimitations.push(
+                      "Decompiled C output truncated after reaching 64 MiB aggregate staging budget.",
+                    );
+                  }
+                }
+              } catch (ghidraErr: unknown) {
+                if (signal.aborted) signal.throwIfAborted();
+                if (isAbortOf(ghidraErr, signal)) throw ghidraErr;
+              }
+            }
+          }
+
+          if (cContent === null) {
+            cContent = [
+              "/**",
+              ` * Reconstructed Entry Scaffolding: ${mod.rawName}`,
+              ` * Phase: ${mod.phase}${mod.typeName ? ` | Type: ${mod.typeName}` : ""}`,
+              ` * GUID: ${mod.guid ?? "N/A"}`,
+              " *",
+              " * NOTE: This file is reconstructed entry point scaffolding for integration",
+              " * and analysis. Native executable instructions reside in the accompanying",
+              " * disassembly and binary payload.",
+              " */",
+              `#include "${headerName}"`,
+              "",
+              scaffold.functionDefinition,
+              "",
+            ].join("\n");
+          }
+          const cBytes = Buffer.from(cContent, "utf8");
+          const cSha256 = sha256Hex(cBytes);
+          publicationEntries.push({
+            relativePath: cRelPath,
+            bytes: cBytes,
+          });
+
+          stagedModules.push({
+            occurrence,
+            guid: mod.guid,
+            name: mod.rawName,
+            phase: mod.phase,
+            disassembly_status: disassemblyStatus,
+            relative_c_file: cRelPath,
+            relative_asm_file: asmRelPath,
+            relative_header_file: headerRelPath,
+            relative_payload_file: relativePayloadFile,
+            c_sha256: cSha256,
+            asm_sha256: asmSha256,
+            header_sha256: headerSha256,
+            payload_sha256: payloadSha256,
+            c_generator: cGenerator,
+            asm_generator: asmGenerator,
+            code_bytes: modBytes.length,
+          });
+        } finally {
+          // Remove each module's temporary scratch files immediately
+          try {
+            await rm(tempEfiPath, { force: true });
+            if (ghidraOutC !== undefined) {
+              await rm(ghidraOutC, { force: true });
+            }
+          } catch {
+            // Ignore scratch unlink error
+          }
+        }
+      }
+
+      const manifestData = {
+        image_sha256: imageSha256,
+        total_modules_found: discoveredModules.length,
+        total_modules_decompiled: stagedModules.length,
+        phases: phaseCounts,
+        limitations: effectiveLimitations,
+        modules: stagedModules.map((m) => ({
+          ...m,
+          c_file: m.relative_c_file,
+          asm_file: m.relative_asm_file,
+          header_file: m.relative_header_file,
+          payload_file: m.relative_payload_file,
+        })),
+      };
+      publicationEntries.push({
+        relativePath: "firmware_manifest.json",
+        bytes: Buffer.from(JSON.stringify(manifestData, null, 2), "utf8"),
+      });
+
+      const readmeLines = [
+        "# Decompiled UEFI Firmware Source Tree",
+        "",
+        `- **Image / Corpus SHA-256**: \`${imageSha256}\``,
+        `- **Total Modules Found**: ${discoveredModules.length}`,
+        `- **Total Modules Decompiled**: ${stagedModules.length}`,
+        "",
+        "## Phases",
+        `- **SEC** (Security Core): ${phaseCounts.sec}`,
+        `- **PEI** (Pre-EFI Initialization): ${phaseCounts.pei}`,
+        `- **DXE** (Driver Execution Environment): ${phaseCounts.dxe}`,
+        `- **SMM** (System Management Mode): ${phaseCounts.smm}`,
+        `- **APP** (UEFI Applications): ${phaseCounts.app}`,
+        `- **MISC**: ${phaseCounts.misc}`,
+        ...(effectiveLimitations.length > 0
+          ? ["", "## Limitations", ...effectiveLimitations.map((l) => `- ${l}`)]
+          : []),
+        "",
+        "## Modules Index",
+        "| Phase | Name | GUID | Size (Bytes) | Disassembly Status | C Scaffold | Disassembly |",
+        "|---|---|---|---|---|---|---|",
+        ...stagedModules.map(
+          (m) =>
+            `| ${m.phase} | \`${m.name}\` | \`${m.guid ?? "N/A"}\` | ${m.code_bytes} | ${m.disassembly_status} | [${m.name}.c](${m.relative_c_file}) | ${m.relative_asm_file ? `[${m.name}.asm](${m.relative_asm_file})` : "N/A"} |`,
+        ),
+      ];
+      publicationEntries.push({
+        relativePath: "README.md",
+        bytes: Buffer.from(readmeLines.join("\n"), "utf8"),
+      });
+
+      const publication = await publishUefiFiles<UefiDecompileResult>({
+        outputDirectory: input.output_directory,
+        operation: request.operation,
+        entries: publicationEntries,
+        signal,
+        checkpoint,
+        resources: this.#resources,
+        buildResult: (outputRoot, _files, receipts) => {
+          const receiptsByRelPath = new Map<string, UefiWriteReceipt>(
+            receipts.map((r) => [r.relativePath, r]),
+          );
+          const finalModules = stagedModules.map((m) => {
+            const cReceipt = receiptsByRelPath.get(m.relative_c_file);
+            const asmReceipt =
+              m.relative_asm_file !== null
+                ? receiptsByRelPath.get(m.relative_asm_file)
+                : undefined;
+            const headerReceipt = receiptsByRelPath.get(m.relative_header_file);
+            const payloadReceipt =
+              m.relative_payload_file !== null
+                ? receiptsByRelPath.get(m.relative_payload_file)
+                : undefined;
+
+            return {
+              ...m,
+              c_file:
+                cReceipt !== undefined
+                  ? cReceipt.path
+                  : join(outputRoot, m.relative_c_file),
+              c_sha256: cReceipt?.sha256 ?? m.c_sha256,
+              asm_file:
+                asmReceipt !== undefined
+                  ? asmReceipt.path
+                  : m.relative_asm_file !== null
+                    ? join(outputRoot, m.relative_asm_file)
+                    : null,
+              asm_sha256: asmReceipt?.sha256 ?? m.asm_sha256,
+              header_file:
+                headerReceipt !== undefined
+                  ? headerReceipt.path
+                  : join(outputRoot, m.relative_header_file),
+              header_sha256: headerReceipt?.sha256 ?? m.header_sha256,
+              payload_file:
+                payloadReceipt !== undefined
+                  ? payloadReceipt.path
+                  : m.relative_payload_file !== null
+                    ? join(outputRoot, m.relative_payload_file)
+                    : null,
+              payload_sha256: payloadReceipt?.sha256 ?? m.payload_sha256,
+            };
+          });
+
+          return uefiResultSchemas.decompile_uefi_firmware.parse({
+            parser: {
+              name: "rea-uefi",
+              version: UEFI_PROVIDER_IDENTITY.version,
+            },
+            image_sha256: imageSha256,
+            output_directory: outputRoot,
+            total_modules_found: discoveredModules.length,
+            total_modules_decompiled: stagedModules.length,
+            phases: phaseCounts,
+            modules: finalModules,
+            producers: {
+              ghidra: ghidraBin,
+              disassembler: input.include_disassembly
+                ? disassemblyEngineUsed
+                : "none",
+            },
+            receipts: receipts.map((r) => ({
+              relative_path: r.relativePath,
+              path: r.path,
+              size: r.size,
+              sha256: r.sha256,
+            })),
+            diagnostics: `Successfully published ${stagedModules.length} decompiled UEFI module(s) across phases into ${outputRoot}.`,
+            limitations: effectiveLimitations,
+          });
+        },
+      });
+
+      const { result } = publication;
+      publishedResult = result;
+      if (publication.failure !== undefined) {
+        throw publication.failure.retainPartialObservation({
+          kind: "uefi",
+          result: jsonValueSchema.parse(result),
+          provenance: {
+            path: input.path,
+            sha256: imageSha256,
+          },
+        });
+      }
+
+      return createAnalysisExecution(result, UEFI_PROVIDER_IDENTITY, {
+        subject: { path: input.path, sha256: imageSha256, format },
+        locations: [{ kind: "artifact-path", path: input.path }],
+        limitations: effectiveLimitations,
+      });
+    } catch (cause: unknown) {
+      establishedError = cause;
+      throw cause;
+    } finally {
+      const released = await this.#resources.release({
+        kind: "private-runtime-root",
+        resource: tempRoot.path,
+        root: tempRoot,
+      });
+
+      let cleanupError: ProviderCleanupError | undefined;
+      if (released.kind === "failed") {
+        const completedObservation =
+          publishedResult !== undefined
+            ? {
+                kind: "uefi" as const,
+                result: jsonValueSchema.parse(publishedResult),
+                provenance: {
+                  path: input.path,
+                  sha256: imageSha256,
+                },
+              }
+            : undefined;
+        cleanupError = new ProviderCleanupError(
+          UEFI_PROVIDER_IDENTITY.id,
+          released.lease.cleanupResources ?? [tempRoot.path],
+          { reason: errorMessage(released.cause) },
+          {
+            cause: released.cause,
+            operation: "decompile_uefi_firmware",
+            ...(completedObservation === undefined
+              ? {}
+              : { completedObservation }),
+          },
+        );
+        new AnalysisCleanupLeaseGroup(cleanupError, [released.lease]);
+      }
+
+      if (signal.aborted) {
+        const partialObservation =
+          publishedResult !== undefined
+            ? {
+                kind: "uefi" as const,
+                result: jsonValueSchema.parse(publishedResult),
+                provenance: {
+                  path: input.path,
+                  sha256: imageSha256,
+                },
+              }
+            : undefined;
+
+        let terminationError: AnalysisError =
+          signal.reason instanceof AnalysisTimeoutError
+            ? new AnalysisTimeoutError(
+                "decompile_uefi_firmware",
+                signal.reason.timeoutMs,
+                {
+                  cause: signal.reason,
+                  partialObservation,
+                },
+              )
+            : cancelledBy("decompile_uefi_firmware", signal, {
+                partialObservation,
+              });
+
+        if (cleanupError !== undefined) {
+          terminationError = analysisErrorWithCleanupDependencies(
+            terminationError,
+            cleanupError,
+            "decompile_uefi_firmware",
+          );
+        }
+
+        if (establishedError instanceof AnalysisError) {
+          if (terminationError instanceof AnalysisCancelledError) {
+            throw analysisErrorWithCancellation(
+              establishedError,
+              terminationError,
+            );
+          }
+          establishedError.retainSecondaryFailure(terminationError);
+          throw establishedError;
+        }
+        if (establishedError === undefined) {
+          throw terminationError;
+        }
+      }
+
+      if (
+        establishedError instanceof AnalysisError &&
+        cleanupError !== undefined
+      ) {
+        throw analysisErrorWithCleanupDependencies(
+          establishedError,
+          cleanupError,
+          "decompile_uefi_firmware",
+        );
+      }
+
+      if (establishedError === undefined && cleanupError !== undefined) {
+        throw cleanupError;
+      }
+    }
+  }
+
+  async #decompileFirmware(
+    request: Extract<UefiRequest, { operation: "decompile_uefi_firmware" }>,
+    imageSha256: string,
+    scan: UefiImageScanSummary,
+    signal: AbortSignal,
+    checkpoint: () => void,
+    remainingTimeMs?: () => number,
+  ): Promise<AnalysisExecution> {
+    const discoveredModules: DiscoveredUefiModule[] = [];
+    const seenSections = new Set<string>();
+
+    for (const volume of scan.volumes) {
+      for (const file of volume.ffs_files) {
+        checkpoint();
+        signal.throwIfAborted();
+
+        for (const section of file.sections) {
+          if (section.type_code === 0x10 || section.type_code === 0x12) {
+            const payload = scan.payloads.get(section.logical_path);
+            if (payload !== undefined && payload.bytes.length > 0) {
+              const dedupeKey = `${file.guid}_${section.logical_path}`;
+              if (seenSections.has(dedupeKey)) continue;
+              seenSections.add(dedupeKey);
+
+              const rawName =
+                file.ui_string ?? `Module_${file.guid.slice(0, 8)}`;
+              const cleanName = rawName.replace(/[^a-zA-Z0-9_-]/g, "_");
+
+              let phase: "SEC" | "PEI" | "DXE" | "SMM" | "APP" | "MISC" = "DXE";
+              if (file.type_name === "security-core") phase = "SEC";
+              else if (file.type_name.includes("pei")) phase = "PEI";
+              else if (
+                file.type_name.includes("smm") ||
+                file.type_name.includes("mm-")
+              )
+                phase = "SMM";
+              else if (file.type_name === "application") phase = "APP";
+              else if (
+                file.type_name === "driver" ||
+                file.type_name === "dxe-core"
+              )
+                phase = "DXE";
+              else phase = "MISC";
+
+              const requested = request.input.filter_phase.toLowerCase();
+              const isCombinedPeimDriver =
+                file.type_name === "combined-peim-driver";
+              const isCombinedSmmDxe = file.type_name === "combined-smm-dxe";
+              const matchesPhase =
+                requested === "all" ||
+                phase.toLowerCase() === requested ||
+                (requested === "dxe" &&
+                  (isCombinedPeimDriver || isCombinedSmmDxe)) ||
+                (requested === "pei" && isCombinedPeimDriver) ||
+                (requested === "smm" && isCombinedSmmDxe);
+
+              if (matchesPhase) {
+                discoveredModules.push({
+                  guid: file.guid,
+                  rawName,
+                  cleanName,
+                  typeName: file.type_name,
+                  phase,
+                  bytes: payload.bytes,
+                  byteLength: payload.bytes.length,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return this.#stageAndPublishModules(
+      request,
+      imageSha256,
+      discoveredModules,
+      scan.limitations,
+      signal,
+      checkpoint,
+      "file",
+      remainingTimeMs,
+    );
+  }
+
+  async #decompileDirectory(
+    request: Extract<UefiRequest, { operation: "decompile_uefi_firmware" }>,
+    signal: AbortSignal,
+    checkpoint: () => void,
+    remainingTimeMs?: () => number,
+  ): Promise<AnalysisExecution> {
+    const input = request.input;
+    const dirEntries = await readdir(input.path, {
+      withFileTypes: true,
+      recursive: true,
+    });
+    const guidRegex =
+      /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+
+    const manifestModulesByRelPath = new Map<
+      string,
+      { guid?: string | null; name?: string; phase?: string }
+    >();
+    try {
+      const manifestPath = join(input.path, "firmware_manifest.json");
+      if (existsSync(manifestPath)) {
+        const manifestRaw = await readFile(manifestPath, "utf8");
+        const parsed = JSON.parse(manifestRaw);
+        if (Array.isArray(parsed?.modules)) {
+          for (const m of parsed.modules) {
+            if (typeof m?.payload_file === "string") {
+              const norm = m.payload_file
+                .split(/[/\\]+/)
+                .join("/")
+                .toLowerCase();
+              manifestModulesByRelPath.set(norm, m);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore unreadable manifest
+    }
+
+    interface CandidateModule {
+      readonly fullPath: string;
+      readonly normRelPath: string;
+      readonly name: string;
+      readonly size: number;
+      readonly phase: "SEC" | "PEI" | "DXE" | "SMM" | "APP" | "MISC";
+      readonly guid: string | null;
+      readonly rawName: string;
+      readonly cleanName: string;
+    }
+    const candidates: CandidateModule[] = [];
+
+    for (const entry of dirEntries) {
+      checkpoint();
+      signal.throwIfAborted();
+      if (!entry.isFile()) continue;
+
+      const parent = entry.parentPath ?? input.path;
+      const fullPath = join(parent, entry.name);
+
+      let fileStat;
+      try {
+        fileStat = await stat(fullPath);
+      } catch {
+        continue;
+      }
+      if (fileStat.size <= 0 || fileStat.size > 32 * 1024 * 1024) continue;
+
+      let isPeOrTe = false;
+      let owner: OwnedFileHandle | undefined;
+      try {
+        const rawHandle = await open(fullPath, "r");
+        owner = new OwnedFileHandle(rawHandle);
+        const headerBuf = Buffer.alloc(64);
+        const { bytesRead } = await owner.handle.read(headerBuf, 0, 64, 0);
+        if (bytesRead >= 2) {
+          const isPe = headerBuf[0] === 0x4d && headerBuf[1] === 0x5a; // MZ
+          const isTe = headerBuf[0] === 0x56 && headerBuf[1] === 0x5a; // VZ
+          isPeOrTe = isPe || isTe;
+        }
+      } catch {
+        continue;
+      } finally {
+        if (owner !== undefined) {
+          const released = await this.#resources.release({
+            kind: "file-handle",
+            resource: fullPath,
+            handle: owner,
+          });
+          if (released.kind === "failed") {
+            const cleanupErr = new ProviderCleanupError(
+              UEFI_PROVIDER_IDENTITY.id,
+              released.lease.cleanupResources ?? [fullPath],
+              { reason: errorMessage(released.cause) },
+              { cause: released.cause, operation: "decompile_uefi_firmware" },
+            );
+            new AnalysisCleanupLeaseGroup(cleanupErr, [released.lease]);
+            throw cleanupErr;
+          }
+        }
+      }
+      if (!isPeOrTe) continue;
+
+      const relPath = relative(input.path, fullPath);
+      const normRelPath = relPath.split(/[/\\]+/).join("/");
+      const segments = normRelPath.toLowerCase().split("/");
+      const fromManifest = manifestModulesByRelPath.get(
+        normRelPath.toLowerCase(),
+      );
+
+      let phase: "SEC" | "PEI" | "DXE" | "SMM" | "APP" | "MISC" = "DXE";
+      const manifestPhase = fromManifest?.phase?.toUpperCase();
+      if (
+        manifestPhase &&
+        ["SEC", "PEI", "DXE", "SMM", "APP", "MISC"].includes(manifestPhase)
+      ) {
+        phase = manifestPhase as "SEC" | "PEI" | "DXE" | "SMM" | "APP" | "MISC";
+      } else if (segments.some((s) => s === "sec")) {
+        phase = "SEC";
+      } else if (segments.some((s) => s === "pei" || s === "peim")) {
+        phase = "PEI";
+      } else if (segments.some((s) => s === "smm")) {
+        phase = "SMM";
+      } else if (segments.some((s) => s === "app" || s === "application")) {
+        phase = "APP";
+      } else if (segments.some((s) => s === "misc")) {
+        phase = "MISC";
+      } else if (segments.some((s) => s === "dxe")) {
+        phase = "DXE";
+      }
+
+      if (
+        input.filter_phase !== "all" &&
+        phase.toLowerCase() !== input.filter_phase.toLowerCase()
+      ) {
+        continue;
+      }
+
+      let guid: string | null = null;
+      if (fromManifest?.guid) {
+        guid = fromManifest.guid.toLowerCase();
+      } else {
+        const nameMatch = entry.name.match(guidRegex);
+        if (nameMatch && nameMatch[1]) {
+          guid = nameMatch[1].toLowerCase();
+        } else {
+          const pathMatch = normRelPath.match(guidRegex);
+          if (pathMatch && pathMatch[1]) {
+            guid = pathMatch[1].toLowerCase();
+          }
+        }
+      }
+
+      let rawName = entry.name.replace(/\.(pe|efi|bin|te)$/i, "");
+      if (
+        typeof fromManifest?.name === "string" &&
+        fromManifest.name.length > 0
+      ) {
+        rawName = fromManifest.name;
+      } else if (guid) {
+        const parentBase = basename(parent);
+        const prefix = `${guid}_`;
+        if (parentBase.toLowerCase().startsWith(prefix)) {
+          const candidateName = parentBase.slice(prefix.length);
+          if (candidateName.length > 0) {
+            rawName = candidateName;
+          }
+        }
+      }
+      const cleanName = rawName.replace(/[^a-zA-Z0-9_-]/g, "_");
+
+      candidates.push({
+        fullPath,
+        normRelPath,
+        name: entry.name,
+        size: fileStat.size,
+        phase,
+        guid,
+        rawName,
+        cleanName,
+      });
+    }
+
+    // Sort candidates deterministically by Unicode code point order (locale-independent)
+    candidates.sort((a, b) =>
+      compareUnicodeCodePoints(a.normRelPath, b.normRelPath),
+    );
+
+    const dirHash = createHash("sha256");
+    const discoveredModules: DiscoveredUefiModule[] = [];
+
+    for (const candidate of candidates) {
+      checkpoint();
+      signal.throwIfAborted();
+      const content = await readFile(candidate.fullPath);
+      const fileSha256 = sha256Hex(content);
+      dirHash.update(compositeKey([candidate.normRelPath, fileSha256]) + "\n");
+      discoveredModules.push({
+        guid: candidate.guid,
+        rawName: candidate.rawName,
+        cleanName: candidate.cleanName,
+        phase: candidate.phase,
+        sourcePath: candidate.fullPath,
+        byteLength: candidate.size,
+      });
+    }
+
+    const dirSha256 =
+      candidates.length === 0
+        ? sha256Hex(Buffer.alloc(0))
+        : dirHash.digest("hex");
+
+    return this.#stageAndPublishModules(
+      request,
+      dirSha256,
+      discoveredModules,
+      [],
+      signal,
+      checkpoint,
+      "directory",
+      remainingTimeMs,
+    );
   }
 
   async #decodeStream(
